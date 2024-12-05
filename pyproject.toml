@@ -1,0 +1,28 @@
+[tool.poetry]
+name = "apple_stock_ml"
+version = "0.1.0"
+description = "Machine learning project for predicting extreme events in Apple stock prices"
+authors = ["Manos Chaniotakis <manos.chaniotakis.n@gmail.com>"]
+license = "MIT"
+
+[tool.poetry.dependencies]
+python = ">=3.10,<3.13" 
+pandas = "^2.2.3"
+numpy = "^1.23"
+yfinance = "*"
+scikit-learn = "*"
+pandas-datareader = "*"
+imbalanced-learn = "^0.12.4"
+matplotlib = "^3.9.3"
+seaborn = "^0.13.2"
+torch = "^2.5.1"
+tqdm = "^4.67.1"
+
+[tool.poetry.dev-dependencies]
+black = "*"
+flake8 = "*"
+pytest = "*"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
