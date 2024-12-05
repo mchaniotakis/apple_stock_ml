@@ -22,6 +22,8 @@ from apple_stock_ml.src.utils.visualizer import ModelVisualizer
 from sklearn.metrics import classification_report, confusion_matrix
 import numpy as np
 import math
+import os
+from tqdm import tqdm
 
 # Set up logger
 logger = setup_logger("train_timesnet", "logs/train_timesnet.log")
@@ -31,7 +33,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train TimesNet model")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=300)
-    parser.add_argument("--learning-rate", type=float, default=0.001)
+    parser.add_argument("--learning-rate", type=float, default=0.01)
     parser.add_argument(
         "--sequence-length", type=int, default=100
     )  # needs to be more for timesNet
@@ -52,15 +54,26 @@ def evaluate_model(model, test_loader, device):
     model.eval()
     all_preds = []
     all_labels = []
+    all_probs = []
 
     with torch.no_grad():
-        for batch_X, batch_y in test_loader:
+        for batch_X, batch_y, _ in test_loader:
             batch_X = batch_X.to(device)
-            outputs = model(batch_X, None, None, None)
-            predictions = outputs.argmax(dim=1).cpu().numpy()
-            all_preds.extend(predictions)
+            outputs = model(batch_X, None)
+            probabilities = F.softmax(outputs, dim=1)
+            predictions = outputs.argmax(dim=1)
+
+            # Move everything to CPU and convert to numpy
+            all_probs.extend(probabilities.cpu().numpy())
+            all_preds.extend(predictions.cpu().numpy())
             all_labels.extend(batch_y.numpy())
 
+    # Convert lists to numpy arrays
+    all_probs = np.array(all_probs)
+    all_preds = np.array(all_preds)
+    all_labels = np.array(all_labels)
+
+    # Calculate metrics
     conf_matrix = confusion_matrix(all_labels, all_preds)
     class_report = classification_report(all_labels, all_preds)
 
@@ -68,7 +81,8 @@ def evaluate_model(model, test_loader, device):
         "confusion_matrix": conf_matrix,
         "classification_report": class_report,
         "predictions": all_preds,
-        "true_labels": all_labels,
+        "true_values": all_labels,
+        "probabilities": all_probs,
     }
 
 
@@ -111,8 +125,6 @@ def collate_fn(data, max_len=None):
     padding_masks = padding_mask(
         torch.tensor(lengths, dtype=torch.int16), max_len=max_len
     )  # (batch_size, padded_length) boolean tensor, "1" means keep
-
-    X = X.permute(0, 2, 1)
 
     return X, targets, padding_masks
 
@@ -392,7 +404,8 @@ class TokenEmbedding(nn.Module):
                 )
 
     def forward(self, x):
-        x = self.tokenConv(x.transpose(1, 2)).transpose(1, 2)
+        # x is B SL C
+        x = self.tokenConv(x.permute(0, 2, 1)).transpose(1, 2)
         return x
 
 
@@ -571,7 +584,7 @@ class TimesNet(nn.Module):
 
     def forward(self, x_enc, x_mark_enc=None):
         # Embedding
-        enc_out = self.enc_embedding(x_enc, x_mark_enc)  # Shape: [B, T, C]
+        enc_out = self.enc_embedding(x_enc, None)  # Shape: [B, T, C]
 
         # TimesNet layers
         for layer in self.model_layers:
@@ -624,7 +637,9 @@ def train_model(
         # Training phase
         model.train()
         train_loss = 0
-        for batch_X, batch_y, padding_mask in train_loader:
+        for batch_X, batch_y, padding_mask in tqdm(
+            train_loader, desc=f"Training epoch {epoch+1}"
+        ):
             batch_X, batch_y = batch_X.to(DEVICE), batch_y.to(DEVICE)
             padding_mask = padding_mask.to(DEVICE)
             if use_augmentations:
@@ -676,6 +691,10 @@ def train_model(
     return model, train_losses, val_losses
 
 
+def invert_channel_dimension(X):
+    return X.permute(0, 2, 1)
+
+
 def main():
     args = parse_args()
 
@@ -691,6 +710,10 @@ def main():
         apply_pca=args.pca,
     )
     X_train, X_val, X_test = normalize_data(X_train, X_val, X_test)
+
+    X_train = invert_channel_dimension(X_train)
+    X_val = invert_channel_dimension(X_val)
+    X_test = invert_channel_dimension(X_test)
 
     # Get balanced sampler
     sampler = get_balanced_sampler(X_train, y_train)
@@ -713,17 +736,17 @@ def main():
         collate_fn=lambda x: collate_fn(x, max_len=args.sequence_length),
     )
 
-    # Initialize model
+    # Initialize models
     model = TimesNet(
-        input_channels=30,  # X_train.shape[1],
+        input_channels=X_train.shape[2],  # padded to sequence length
         sequence_length=args.sequence_length,
         dropout=0.1,
         freq="d",
         embed_type="timeF",
         num_classes=2,
-        dimension_model=16,
-        num_layers=2,
-        top_k=3,
+        dimension_model=64,
+        num_layers=3,
+        top_k=1,
         prediction_length=0,
     )
 
@@ -782,6 +805,7 @@ def main():
     visualizer.plot_precision_recall_curves()
     visualizer.save_run_metrics()
 
+    os.makedirs(os.path.dirname(args.model_output), exist_ok=True)
     # Save model
     torch.save(model.state_dict(), args.model_output)
 

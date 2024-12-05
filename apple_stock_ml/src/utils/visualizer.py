@@ -77,10 +77,10 @@ class ModelVisualizer:
             "val_losses": val_losses or [],
             "predictions": eval_metrics["predictions"],
             "true_values": eval_metrics["true_values"],
-            "probabilities": eval_metrics["probabilities"],
+            "probabilities": eval_metrics.get("probabilities", None),
             "test_loss": eval_metrics.get("test_loss", None),
-            "confusion_matrix": eval_metrics["confusion_matrix"],
-            "classification_report": eval_metrics["classification_report"],
+            "confusion_matrix": eval_metrics.get("confusion_matrix", None),
+            "classification_report": eval_metrics.get("classification_report", None),
             "metadata": metadata or {},
             "timestamp": datetime.now().isoformat(),
         }

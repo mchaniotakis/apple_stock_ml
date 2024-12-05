@@ -66,12 +66,38 @@ def get_cache_path(ticker, start_date, end_date, cache_dir="data/cache"):
     return cache_dir / cache_name
 
 
-def get_sp500_tickers():
-    """Get list of S&P 500 tickers from Wikipedia."""
+def get_sp500_tickers(top_n=None):
+    """Get list of S&P 500 tickers from Wikipedia.
+
+    Args:
+        top_n (int, optional): Number of top companies to return).
+                             If None, returns all companies.
+    """
     logger.info("Retrieving S&P 500 tickers from Wikipedia")
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
     tables = pd.read_html(url)
     sp500 = tables[0]  # First table contains S&P 500 companies
+
+    if top_n is not None:
+
+        # Get market cap data for sorting
+        tickers = sp500["Symbol"].tolist()
+        market_caps = {}
+
+        logger.info(f"Fetching market cap data for {len(tickers)} companies")
+        for ticker in tqdm(tickers, desc="Fetching market caps"):
+            try:
+                stock = yf.Ticker(ticker)
+                market_cap = stock.info.get("marketCap", 0)
+                market_caps[ticker] = market_cap
+            except Exception as e:
+                logger.warning(f"Failed to fetch market cap for {ticker}: {e}")
+                market_caps[ticker] = 0
+
+        # Sort tickers by market cap and take top N
+        sorted_tickers = sorted(market_caps.items(), key=lambda x: x[1], reverse=True)
+        return [ticker for ticker, _ in sorted_tickers[:top_n]]
+
     return sp500["Symbol"].tolist()
 
 
@@ -92,8 +118,12 @@ def load_stock_data(
         return data
 
     logger.info(f"Downloading {ticker} stock data from {start_date} to {end_date}")
-    if ticker == "SP500":
-        tickers = get_sp500_tickers()
+    if ticker.startswith("SP500"):
+        if ticker.replace("SP500", "") != "" and "TOP" in ticker:
+            top_n = int(ticker.replace("SP500TOP", ""))
+        else:
+            top_n = None
+        tickers = get_sp500_tickers(top_n)
         logger.info(f"Downloading data for {len(tickers)} S&P 500 stocks")
         all_data = {}
         for tick in tickers:
@@ -282,10 +312,12 @@ def add_noise_to_sequence(batched_sequence, p=0.3):
         return batched_sequence
     for sequence in batched_sequence:
         for feature in range(sequence.shape[0]):
-            noise_magnitude = np.std(sequence[feature].numpy()) * np.random.uniform(
-                0.9, 0.11
-            )
-            noise = np.random.normal(0, noise_magnitude, sequence.shape[1])
+            noise_magnitude = torch.std(sequence[feature]) * torch.FloatTensor(
+                1
+            ).uniform_(0.09, 0.11).to(sequence.device)
+            noise = torch.normal(
+                mean=0.0, std=float(noise_magnitude), size=sequence[feature].shape
+            ).to(sequence.device)
             sequence[feature] += noise
     return batched_sequence
 
@@ -297,6 +329,7 @@ def mask_sequence_augmentation(batched_sequence, p=0.1):
     for sequence in batched_sequence:
         for feature in range(sequence.shape[0]):
             mask = np.random.choice([0, 1], size=sequence.shape[1], p=[0.9, 0.1])
+            mask = torch.tensor(mask).to(sequence.device)
             sequence[feature] *= mask
     return batched_sequence
 
