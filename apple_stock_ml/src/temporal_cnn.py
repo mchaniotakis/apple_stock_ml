@@ -18,8 +18,8 @@ from apple_stock_ml.src.data_preprocessing import (
 )
 from apple_stock_ml.src.utils.visualizer import ModelVisualizer
 from tqdm import tqdm
+from apple_stock_ml import DEVICE
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # Set up logger
 logger = setup_logger("temporal_cnn", "logs/temporal_cnn.log")
 

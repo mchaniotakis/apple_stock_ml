@@ -1,17 +1,22 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.cuda.amp import autocast, GradScaler
+from torch import autocast, GradScaler
 from torch.utils.data import DataLoader, TensorDataset
+from torch.nn import functional as F
 import argparse
 from pathlib import Path
 from datetime import datetime
-from apple_stock_ml.src.data_preprocessing import (
-    load_stock_data,
-    prepare_sp500_features,
-    split_time_series_data,
+from apple_stock_ml.src.data_preprocessing import get_data
+from apple_stock_ml.src.temporal_cnn import (
+    get_balanced_sampler,
+    normalize_data,
+    add_noise_to_sequence,
+    mask_sequence_augmentation,
+    EarlyStopping,
+    compute_class_weight,
 )
-from apple_stock_ml.src.temporal_cnn import EarlyStopping, create_sequences
+from apple_stock_ml import DEVICE
 from apple_stock_ml.src.utils.logger import setup_logger
 from apple_stock_ml.src.utils.visualizer import ModelVisualizer
 from sklearn.metrics import classification_report, confusion_matrix
@@ -25,7 +30,7 @@ logger = setup_logger("train_timesnet", "logs/train_timesnet.log")
 def parse_args():
     parser = argparse.ArgumentParser(description="Train TimesNet model")
     parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument("--learning-rate", type=float, default=0.001)
     parser.add_argument(
         "--sequence-length", type=int, default=100
@@ -36,6 +41,10 @@ def parse_args():
     parser.add_argument("--start-date", type=str, default="2015-01-01")
     parser.add_argument("--end-date", type=str, default="2024-01-31")
     parser.add_argument("--threshold", type=float, default=2.0)
+    parser.add_argument("--ticker", type=str, default="AAPL")
+    parser.add_argument("--pca", action="store_true")
+    parser.add_argument("--augs", action="store_true")
+
     return parser.parse_args()
 
 
@@ -63,156 +72,147 @@ def evaluate_model(model, test_loader, device):
     }
 
 
-def train_model(model, train_loader, val_loader, criterion, optimizer, args):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = model.to(device)
-    scaler = GradScaler()
-    early_stopping = EarlyStopping(patience=args.patience)
+def collate_fn(data, max_len=None):
+    """Build mini-batch tensors from a list of (X, mask) tuples. Mask input. Create
+    Args:
+        data: len(batch_size) list of tuples (X, y).
+            - X: torch tensor of shape (seq_length, feat_dim); variable seq_length.
+            - y: torch tensor of shape (num_labels,) : class indices or numerical targets
+                (for classification or regression, respectively). num_labels > 1 for multi-task models
+        max_len: global fixed sequence length. Used for architectures requiring fixed length input,
+            where the batch length cannot vary dynamically. Longer sequences are clipped, shorter are padded with 0s
+    Returns:
+        X: (batch_size, padded_length, feat_dim) torch tensor of masked features (input)
+        targets: (batch_size, padded_length, feat_dim) torch tensor of unmasked features (output)
+        target_masks: (batch_size, padded_length, feat_dim) boolean torch tensor
+            0 indicates masked values to be predicted, 1 indicates unaffected/"active" feature values
+        padding_masks: (batch_size, padded_length) boolean tensor, 1 means keep vector at this position, 0 means padding
+    """
 
-    train_losses = []
-    val_losses = []
+    batch_size = len(data)
+    features, labels = zip(*data)
 
-    for epoch in range(args.epochs):
-        # Training phase
-        model.train()
-        train_loss = 0
+    # Stack and pad features and masks (convert 2D to 3D tensors, i.e. add batch dimension)
+    lengths = [
+        X.shape[0] for X in features
+    ]  # original sequence length for each time series
+    if max_len is None:
+        max_len = max(lengths)
 
-        for batch_X, batch_y in train_loader:
-            batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+    X = torch.zeros(
+        batch_size, max_len, features[0].shape[-1]
+    )  # (batch_size, padded_length, feat_dim)
+    for i in range(batch_size):
+        end = min(lengths[i], max_len)
+        X[i, :end, :] = features[i][:end, :]
 
-            optimizer.zero_grad()
+    targets = torch.stack(labels, dim=0)  # (batch_size, num_labels)
 
-            # Use autocast for mixed precision training
-            with autocast():
-                outputs = model(batch_X, None, None, None)
-                loss = criterion(outputs, batch_y)
+    padding_masks = padding_mask(
+        torch.tensor(lengths, dtype=torch.int16), max_len=max_len
+    )  # (batch_size, padded_length) boolean tensor, "1" means keep
 
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+    X = X.permute(0, 2, 1)
 
-            train_loss += loss.item()
-
-        avg_train_loss = train_loss / len(train_loader)
-        train_losses.append(avg_train_loss)
-
-        # Validation phase
-        model.eval()
-        val_loss = 0
-        with torch.no_grad():
-            for batch_X, batch_y in val_loader:
-                batch_X, batch_y = batch_X.to(device), batch_y.to(device)
-                outputs = model(batch_X, None, None, None)
-                val_loss += criterion(outputs, batch_y).item()
-
-        avg_val_loss = val_loss / len(val_loader)
-        val_losses.append(avg_val_loss)
-
-        logger.info(f"Epoch {epoch+1}/{args.epochs}")
-        logger.info(f"Training Loss: {avg_train_loss:.4f}")
-        logger.info(f"Validation Loss: {avg_val_loss:.4f}")
-
-        early_stopping(avg_val_loss)
-        if early_stopping.early_stop:
-            logger.info("Early stopping triggered")
-            break
-
-    return model, train_losses, val_losses
+    return X, targets, padding_masks
 
 
-def main():
-    args = parse_args()
-
-    # Load and preprocess data
-    data = load_stock_data(
-        start_date=args.start_date,
-        end_date=args.end_date,
-        ticker="SP500",
-        cache_path=Path("data/cache") / f"SP500_{args.start_date}_{args.end_date}.pkl",
+def padding_mask(lengths, max_len=None):
+    """
+    Used to mask padded positions: creates a (batch_size, max_len) boolean mask from a tensor of sequence lengths,
+    where 1 means keep element at this position (time step)
+    """
+    batch_size = lengths.numel()
+    max_len = (
+        max_len or lengths.max_val()
+    )  # trick works because of overloading of 'or' operator for non-boolean types
+    return (
+        torch.arange(0, max_len, device=lengths.device)
+        .type_as(lengths)
+        .repeat(batch_size, 1)
+        .lt(lengths.unsqueeze(1))
     )
 
-    # Prepare features
-    X, y = prepare_sp500_features(data, threshold=args.threshold)
 
-    # Split data
-    X_train, X_val, X_test, y_train, y_val, y_test = split_time_series_data(
-        X, y, use_smote=args.use_smote
-    )
+class Normalizer(object):
+    """
+    Normalizes dataframe across ALL contained rows (time steps). Different from per-sample normalization.
+    """
 
-    # Create sequences
-    X_train_seq, y_train_seq = create_sequences(X_train, y_train, args.sequence_length)
-    X_val_seq, y_val_seq = create_sequences(X_val, y_val, args.sequence_length)
-    X_test_seq, y_test_seq = create_sequences(X_test, y_test, args.sequence_length)
+    def __init__(
+        self,
+        norm_type="standardization",
+        mean=None,
+        std=None,
+        min_val=None,
+        max_val=None,
+    ):
+        """
+        Args:
+            norm_type: choose from:
+                "standardization", "minmax": normalizes dataframe across ALL contained rows (time steps)
+                "per_sample_std", "per_sample_minmax": normalizes each sample separately (i.e. across only its own rows)
+            mean, std, min_val, max_val: optional (num_feat,) Series of pre-computed values
+        """
 
-    # Create data loaders
-    train_loader = DataLoader(
-        TensorDataset(X_train_seq, y_train_seq),
-        batch_size=args.batch_size,
-        shuffle=True,
-    )
-    val_loader = DataLoader(
-        TensorDataset(X_val_seq, y_val_seq), batch_size=args.batch_size
-    )
-    test_loader = DataLoader(
-        TensorDataset(X_test_seq, y_test_seq), batch_size=args.batch_size
-    )
+        self.norm_type = norm_type
+        self.mean = mean
+        self.std = std
+        self.min_val = min_val
+        self.max_val = max_val
 
-    # Initialize model
-    model = TimesNet(
-        input_channels=X.shape[1],
-        sequence_length=args.sequence_length,
-        encoding_layers=2,
-        dropout=0.1,
-        freq="d",
-        embed_type="timeF",
-        num_classes=2,
-        dimention_model=64,
-        output_size=7,
-        num_layers=2,
-        top_k=3,
-        label_length=48,
-    )
+    def normalize(self, df):
+        """
+        Args:
+            df: input dataframe
+        Returns:
+            df: normalized dataframe
+        """
+        if self.norm_type == "standardization":
+            if self.mean is None:
+                self.mean = df.mean()
+                self.std = df.std()
+            return (df - self.mean) / (self.std + np.finfo(float).eps)
 
-    # Define loss and optimizer
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
+        elif self.norm_type == "minmax":
+            if self.max_val is None:
+                self.max_val = df.max()
+                self.min_val = df.min()
+            return (df - self.min_val) / (
+                self.max_val - self.min_val + np.finfo(float).eps
+            )
 
-    # Initialize visualizer
-    visualizer = ModelVisualizer(save_dir="visualizations/timesnet")
+        elif self.norm_type == "per_sample_std":
+            grouped = df.groupby(by=df.index)
+            return (df - grouped.transform("mean")) / grouped.transform("std")
 
-    # Train model
-    model, train_losses, val_losses = train_model(
-        model, train_loader, val_loader, criterion, optimizer, args
-    )
+        elif self.norm_type == "per_sample_minmax":
+            grouped = df.groupby(by=df.index)
+            min_vals = grouped.transform("min")
+            return (df - min_vals) / (
+                grouped.transform("max") - min_vals + np.finfo(float).eps
+            )
 
-    # Evaluate model
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    eval_metrics = evaluate_model(model, test_loader, device)
+        else:
+            raise (NameError(f'Normalize method "{self.norm_type}" not implemented'))
 
-    # Add run to visualizer
-    visualizer.add_evaluation(
-        run_name=f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-        eval_metrics=eval_metrics,
-        train_losses=train_losses,
-        val_losses=val_losses,
-        metadata={
-            "sequence_length": args.sequence_length,
-            "batch_size": args.batch_size,
-            "learning_rate": args.learning_rate,
-            "epochs": args.epochs,
-            "patience": args.patience,
-        },
-    )
 
-    # Generate visualizations
-    visualizer.plot_learning_curves()
-    visualizer.plot_confusion_matrices()
-    visualizer.plot_roc_curves()
-    visualizer.plot_precision_recall_curves()
-    visualizer.save_run_metrics()
+def interpolate_missing(y):
+    """
+    Replaces NaN values in pd.Series `y` using linear interpolation
+    """
+    if y.isna().any():
+        y = y.interpolate(method="linear", limit_direction="both")
+    return y
 
-    # Save model
-    torch.save(model.state_dict(), args.model_output)
+
+def subsample(y, limit=256, factor=2):
+    """
+    If a given Series is longer than `limit`, returns subsampled sequence by the specified integer factor
+    """
+    if len(y) > limit:
+        return y[::factor].reset_index(drop=True)
+    return y
 
 
 class Inception_Block_V1(nn.Module):
@@ -301,66 +301,85 @@ def FFT_for_Period(x, k=2):
 
 
 class TimesBlock(nn.Module):
-    def __init__(self, seq_len, in_channels, d_ff=256, num_kernels=6, top_k=2):
+    def __init__(
+        self,
+        sequence_length,
+        input_dim,
+        prediction_length=0,
+        hidden_dim=256,
+        num_kernels=6,
+        top_k=3,
+    ):
         super(TimesBlock, self).__init__()
-        self.seq_len = seq_len
-        self.k = top_k  # frequences to consider
-        self.in_channels = in_channels
-        self.d_ff = d_ff
-        self.num_kernels = num_kernels
+        self.sequence_length = sequence_length
+        self.prediction_length = prediction_length
+        self.top_k = top_k  # Number of top periods to consider
 
         # Simplified inception blocks
         self.conv = nn.Sequential(
-            Inception_Block_V1(in_channels, d_ff, num_kernels=num_kernels),
+            Inception_Block_V1(input_dim, hidden_dim, num_kernels=num_kernels),
             nn.GELU(),
-            Inception_Block_V1(d_ff, in_channels, num_kernels=num_kernels),
+            Inception_Block_V1(hidden_dim, input_dim, num_kernels=num_kernels),
         )
 
     def forward(self, x):
         B, T, N = x.size()
-        period_list, period_weight = FFT_for_Period(x, self.k)
+        period_list, period_weight = FFT_for_Period(x, self.top_k)
 
         res = []
-        for i in range(self.k):
+        total_length = self.sequence_length + self.prediction_length
+        for i in range(self.top_k):
             period = period_list[i]
-            # padding
-            if (self.seq_len + self.pred_len) % period != 0:
-                length = (((self.seq_len + self.pred_len) // period) + 1) * period
-                padding = torch.zeros(
-                    [x.shape[0], (length - (self.seq_len + self.pred_len)), x.shape[2]]
-                ).to(x.device)
+            # Padding if necessary
+            if total_length % period != 0:
+                length = ((total_length // period) + 1) * period
+                padding = torch.zeros(B, length - total_length, N).to(x.device)
                 out = torch.cat([x, padding], dim=1)
             else:
-                length = self.seq_len + self.pred_len
+                length = total_length
                 out = x
-            # reshape
+            # Reshape
             out = (
                 out.reshape(B, length // period, period, N)
                 .permute(0, 3, 1, 2)
                 .contiguous()
             )
-            # 2D conv: from 1d Variation to 2d Variation
+            # 2D convolution
             out = self.conv(out)
-            # reshape back
+            # Reshape back
             out = out.permute(0, 2, 3, 1).reshape(B, -1, N)
-            res.append(out[:, : (self.seq_len + self.pred_len), :])
+            res.append(out[:, :total_length, :])
         res = torch.stack(res, dim=-1)
-        # adaptive aggregation
+        # Adaptive aggregation
         period_weight = F.softmax(period_weight, dim=1)
-        period_weight = period_weight.unsqueeze(1).unsqueeze(1).repeat(1, T, N, 1)
-        res = torch.sum(res * period_weight, -1)
-        # residual connection
+        period_weight = (
+            period_weight.unsqueeze(1).unsqueeze(1).repeat(1, total_length, N, 1)
+        )
+        res = torch.sum(res * period_weight, dim=-1)
+        # Residual connection
         res = res + x
         return res
 
 
+def FFT_for_Period(x, k=3):
+    B, T, N = x.size()
+    xf = torch.fft.rfft(x, dim=1)
+    frequency_list = torch.abs(xf).mean(dim=0).mean(dim=-1)
+    frequency_list[0] = 0  # Ignore the zero frequency component
+    _, top_k_indices = torch.topk(frequency_list, k)
+    top_k_indices = top_k_indices.detach().cpu().numpy()
+    periods = T // top_k_indices
+    period_weights = torch.abs(xf).mean(dim=-1)[:, top_k_indices]
+    return periods, period_weights
+
+
 class TokenEmbedding(nn.Module):
-    def __init__(self, channels_in, dimention_model):
+    def __init__(self, channels_in, dimension_model):
         super(TokenEmbedding, self).__init__()
-        padding = 1 if torch.__version__ >= "1.5.0" else 2
+        padding = 1
         self.tokenConv = nn.Conv1d(
             in_channels=channels_in,
-            out_channels=dimention_model,
+            out_channels=dimension_model,
             kernel_size=3,
             padding=padding,
             padding_mode="circular",
@@ -373,21 +392,21 @@ class TokenEmbedding(nn.Module):
                 )
 
     def forward(self, x):
-        x = self.tokenConv(x.permute(0, 2, 1)).transpose(1, 2)
+        x = self.tokenConv(x.transpose(1, 2)).transpose(1, 2)
         return x
 
 
 class PositionalEmbedding(nn.Module):
-    def __init__(self, dimention_model, max_len=5000):
+    def __init__(self, dimension_model, max_len=5000):
         super(PositionalEmbedding, self).__init__()
         # Compute the positional encodings once in log space.
-        pe = torch.zeros(max_len, dimention_model).float()
+        pe = torch.zeros(max_len, dimension_model).float()
         pe.require_grad = False
 
         position = torch.arange(0, max_len).float().unsqueeze(1)
         div_term = (
-            torch.arange(0, dimention_model, 2).float()
-            * -(math.log(10000.0) / dimention_model)
+            torch.arange(0, dimension_model, 2).float()
+            * -(math.log(10000.0) / dimension_model)
         ).exp()
 
         pe[:, 0::2] = torch.sin(position * div_term)
@@ -401,21 +420,22 @@ class PositionalEmbedding(nn.Module):
 
 
 class FixedEmbedding(nn.Module):
-    def __init__(self, c_in, d_model):
+    def __init__(self, channels_in, dimension_model):
         super(FixedEmbedding, self).__init__()
 
-        w = torch.zeros(c_in, d_model).float()
+        w = torch.zeros(channels_in, dimension_model).float()
         w.require_grad = False
 
-        position = torch.arange(0, c_in).float().unsqueeze(1)
+        position = torch.arange(0, channels_in).float().unsqueeze(1)
         div_term = (
-            torch.arange(0, d_model, 2).float() * -(math.log(10000.0) / d_model)
+            torch.arange(0, dimension_model, 2).float()
+            * -(math.log(10000.0) / dimension_model)
         ).exp()
 
         w[:, 0::2] = torch.sin(position * div_term)
         w[:, 1::2] = torch.cos(position * div_term)
 
-        self.emb = nn.Embedding(c_in, d_model)
+        self.emb = nn.Embedding(channels_in, dimension_model)
         self.emb.weight = nn.Parameter(w, requires_grad=False)
 
     def forward(self, x):
@@ -423,7 +443,7 @@ class FixedEmbedding(nn.Module):
 
 
 class TemporalEmbedding(nn.Module):
-    def __init__(self, d_model, embed_type="fixed", freq="h"):
+    def __init__(self, dimension_model, embed_type="fixed", freq="h"):
         super(TemporalEmbedding, self).__init__()
 
         minute_size = 4
@@ -434,11 +454,11 @@ class TemporalEmbedding(nn.Module):
 
         Embed = FixedEmbedding if embed_type == "fixed" else nn.Embedding
         if freq == "t":
-            self.minute_embed = Embed(minute_size, d_model)
-        self.hour_embed = Embed(hour_size, d_model)
-        self.weekday_embed = Embed(weekday_size, d_model)
-        self.day_embed = Embed(day_size, d_model)
-        self.month_embed = Embed(month_size, d_model)
+            self.minute_embed = Embed(minute_size, dimension_model)
+        self.hour_embed = Embed(hour_size, dimension_model)
+        self.weekday_embed = Embed(weekday_size, dimension_model)
+        self.day_embed = Embed(day_size, dimension_model)
+        self.month_embed = Embed(month_size, dimension_model)
 
     def forward(self, x):
         x = x.long()
@@ -454,12 +474,12 @@ class TemporalEmbedding(nn.Module):
 
 
 class TimeFeatureEmbedding(nn.Module):
-    def __init__(self, d_model, embed_type="timeF", freq="h"):
+    def __init__(self, dimension_model, embed_type="timeF", freq="h"):
         super(TimeFeatureEmbedding, self).__init__()
 
         freq_map = {"h": 4, "t": 5, "s": 6, "m": 1, "a": 1, "w": 2, "d": 3, "b": 3}
         d_inp = freq_map[freq]
-        self.embed = nn.Linear(d_inp, d_model, bias=False)
+        self.embed = nn.Linear(d_inp, dimension_model, bias=False)
 
     def forward(self, x):
         return self.embed(x)
@@ -467,16 +487,22 @@ class TimeFeatureEmbedding(nn.Module):
 
 class DataEmbedding(nn.Module):
     def __init__(
-        self, input_channels, d_model, embed_type="fixed", freq="h", dropout=0.1
+        self, input_channels, dimension_model, embed_type="fixed", freq="h", dropout=0.1
     ):
         super(DataEmbedding, self).__init__()
 
-        self.value_embedding = TokenEmbedding(c_in=input_channels, d_model=d_model)
-        self.position_embedding = PositionalEmbedding(d_model=d_model)
+        self.value_embedding = TokenEmbedding(
+            channels_in=input_channels, dimension_model=dimension_model
+        )
+        self.position_embedding = PositionalEmbedding(dimension_model=dimension_model)
         self.temporal_embedding = (
-            TemporalEmbedding(d_model=d_model, embed_type=embed_type, freq=freq)
+            TemporalEmbedding(
+                dimension_model=dimension_model, embed_type=embed_type, freq=freq
+            )
             if embed_type != "timeF"
-            else TimeFeatureEmbedding(d_model=d_model, embed_type=embed_type, freq=freq)
+            else TimeFeatureEmbedding(
+                dimension_model=dimension_model, embed_type=embed_type, freq=freq
+            )
         )
         self.dropout = nn.Dropout(p=dropout)
 
@@ -497,52 +523,267 @@ class TimesNet(nn.Module):
         self,
         input_channels,
         sequence_length,
-        encoding_layers,
+        num_classes=2,
+        num_layers=2,
+        dimension_model=64,
+        dropout=0.1,
+        freq="d",
+        embed_type="timeF",
+        prediction_length=0,
+        hidden_dim=256,
+        num_kernels=6,
+        top_k=3,
+    ):
+        super(TimesNet, self).__init__()
+        self.sequence_length = sequence_length
+        self.prediction_length = prediction_length
+        self.num_layers = num_layers
+        self.dimension_model = dimension_model
+
+        # Input embedding
+        self.enc_embedding = DataEmbedding(
+            input_channels=input_channels,
+            dimension_model=dimension_model,
+            embed_type=embed_type,
+            freq=freq,
+            dropout=dropout,
+        )
+
+        # TimesBlocks
+        self.model_layers = nn.ModuleList(
+            [
+                TimesBlock(
+                    sequence_length=self.sequence_length,
+                    prediction_length=self.prediction_length,
+                    input_dim=dimension_model,
+                    hidden_dim=hidden_dim,
+                    num_kernels=num_kernels,
+                    top_k=top_k,
+                )
+                for _ in range(self.num_layers)
+            ]
+        )
+        self.layer_norm = nn.LayerNorm(dimension_model)
+
+        self.activation = F.gelu
+        self.dropout = nn.Dropout(dropout)
+        self.projection = nn.Linear(dimension_model * self.sequence_length, num_classes)
+
+    def forward(self, x_enc, x_mark_enc=None):
+        # Embedding
+        enc_out = self.enc_embedding(x_enc, x_mark_enc)  # Shape: [B, T, C]
+
+        # TimesNet layers
+        for layer in self.model_layers:
+            enc_out = self.layer_norm(layer(enc_out))
+
+        # Output
+        output = self.activation(enc_out)
+        output = self.dropout(output)
+        # Reshape for classification
+        output = output.reshape(output.shape[0], -1)
+        output = self.projection(output)
+        return output
+
+
+def train_model(
+    model,
+    train_loader,
+    val_loader,
+    criterion,
+    optimizer,
+    scheduler,
+    use_augmentations=True,
+    num_epochs=100,
+    patience=7,
+):
+    """Train the temporal CNN model."""
+    model = model.to(DEVICE)
+
+    # Calculate class weights
+    all_labels = []
+    for _, labels, padding_mask in train_loader:
+        all_labels.extend(labels.numpy())
+    class_weights = compute_class_weight(
+        "balanced", classes=np.unique(all_labels), y=all_labels
+    )
+    weights = torch.FloatTensor(class_weights).to(DEVICE)
+
+    # Update criterion with weights
+    criterion = nn.CrossEntropyLoss(weight=weights)
+
+    early_stopping = EarlyStopping(patience=patience)
+
+    train_losses = []
+    val_losses = []
+
+    best_model = None
+    best_val_loss = float("inf")
+
+    for epoch in range(num_epochs):
+        # Training phase
+        model.train()
+        train_loss = 0
+        for batch_X, batch_y, padding_mask in train_loader:
+            batch_X, batch_y = batch_X.to(DEVICE), batch_y.to(DEVICE)
+            padding_mask = padding_mask.to(DEVICE)
+            if use_augmentations:
+                batch_X = add_noise_to_sequence(batch_X)
+                batch_X = mask_sequence_augmentation(batch_X)
+            optimizer.zero_grad()
+            outputs = model(batch_X, None)
+            loss = criterion(outputs, batch_y)
+            loss.backward()
+
+            # Add gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            optimizer.step()
+            train_loss += loss.item()
+
+        avg_train_loss = train_loss / len(train_loader)
+        train_losses.append(avg_train_loss)
+
+        # Validation phase
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for batch_X, batch_y, padding_mask in val_loader:
+                batch_X, batch_y = batch_X.to(DEVICE), batch_y.to(DEVICE)
+                padding_mask = padding_mask.to(DEVICE)
+                outputs = model(batch_X, None)
+                val_loss += criterion(outputs, batch_y).item()
+                if best_model is None or val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    best_model = model.state_dict()
+        avg_val_loss = val_loss / len(val_loader)
+        val_losses.append(avg_val_loss)
+
+        # Step the scheduler based on validation loss
+        scheduler.step(avg_val_loss)
+
+        # Log progress
+        logger.info(f"Epoch {epoch+1}/{num_epochs}")
+        logger.info(f"Training Loss: {avg_train_loss:.4f}")
+        logger.info(f"Validation Loss: {avg_val_loss:.4f}")
+
+        # Early stopping
+        early_stopping(avg_val_loss)
+        if early_stopping.early_stop:
+            logger.info("Early stopping triggered")
+            break
+
+    return model, train_losses, val_losses
+
+
+def main():
+    args = parse_args()
+
+    # Split the data
+    X_train, X_val, X_test, y_train, y_val, y_test = get_data(
+        ticker=args.ticker,
+        start_date=args.start_date,
+        end_date=args.end_date,
+        threshold=args.threshold,
+        use_smote=args.use_smote,
+        sequence_length=args.sequence_length,
+        as_tensor=True,
+        apply_pca=args.pca,
+    )
+    X_train, X_val, X_test = normalize_data(X_train, X_val, X_test)
+
+    # Get balanced sampler
+    sampler = get_balanced_sampler(X_train, y_train)
+
+    # Create data loader with the sampler
+    train_loader = torch.utils.data.DataLoader(
+        torch.utils.data.TensorDataset(X_train, y_train),
+        batch_size=args.batch_size,
+        sampler=sampler,
+        collate_fn=lambda x: collate_fn(x, max_len=args.sequence_length),
+    )
+    val_loader = torch.utils.data.DataLoader(
+        torch.utils.data.TensorDataset(X_val, y_val),
+        batch_size=args.batch_size,
+        collate_fn=lambda x: collate_fn(x, max_len=args.sequence_length),
+    )
+    test_loader = torch.utils.data.DataLoader(
+        torch.utils.data.TensorDataset(X_test, y_test),
+        batch_size=args.batch_size,
+        collate_fn=lambda x: collate_fn(x, max_len=args.sequence_length),
+    )
+
+    # Initialize model
+    model = TimesNet(
+        input_channels=30,  # X_train.shape[1],
+        sequence_length=args.sequence_length,
         dropout=0.1,
         freq="d",
         embed_type="timeF",
         num_classes=2,
-        dimention_model=64,
-        output_size=7,
+        dimension_model=16,
         num_layers=2,
-        top_k=3,  # T for imesBlock
-        label_length=48,  # start token length
-    ):
-        super(TimesNet, self).__init__()
-        self.encoding_layers = encoding_layers
-        # Input embedding
-        self.enc_embedding = DataEmbedding(
-            input_channels,
-            dimention_model,
-            embed_type,
-            freq,
-            dropout,
-        )
+        top_k=3,
+        prediction_length=0,
+    )
 
-        self.layer = encoding_layers
-        self.layer_norm = nn.LayerNorm(dimention_model)
+    # Initialize visualizer
+    visualizer = ModelVisualizer(save_dir="visualizations/timesnet")
+    # Define loss and optimizer
+    criterion = nn.CrossEntropyLoss()
 
-        self.act = F.gelu
-        self.dropout = nn.Dropout(dropout)
-        self.projection = nn.Linear(dimention_model * sequence_length, num_classes)
+    optimizer = optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=args.learning_rate,
+        epochs=args.epochs,
+        steps_per_epoch=len(train_loader),
+        pct_start=0.3,  # Spend 30% of time warming up
+        div_factor=25,  # Initial lr = max_lr/25
+        final_div_factor=1e4,  # Final lr = max_lr/10000
+    )
 
-    def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None):
-        # embedding
-        enc_out = self.enc_embedding(x_enc, None)  # [B,T,C]
-        # TimesNet
-        for i in range(self.layer):
-            enc_out = self.layer_norm(self.model[i](enc_out))
+    # Train model
+    model, train_losses, val_losses = train_model(
+        model,
+        train_loader,
+        val_loader,
+        criterion,
+        optimizer,
+        scheduler,
+        use_augmentations=args.augs,
+        num_epochs=args.epochs,
+        patience=args.patience,
+    )
 
-        # Output
-        # the output transformer encoder/decoder embeddings don't include non-linearity
-        output = self.act(enc_out)
-        output = self.dropout(output)
-        # zero-out padding embeddings
-        output = output * x_mark_enc.unsqueeze(-1)
-        # (batch_size, seq_length * d_model)
-        output = output.reshape(output.shape[0], -1)
-        output = self.projection(output)  # (batch_size, num_classes)
-        return output
+    # Evaluate model
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    eval_metrics = evaluate_model(model, test_loader, device)
+
+    # Add run to visualizer
+    visualizer.add_evaluation(
+        run_name=f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+        eval_metrics=eval_metrics,
+        train_losses=train_losses,
+        val_losses=val_losses,
+        metadata={
+            "sequence_length": args.sequence_length,
+            "batch_size": args.batch_size,
+            "learning_rate": args.learning_rate,
+            "epochs": args.epochs,
+            "patience": args.patience,
+        },
+    )
+
+    # Generate visualizations
+    visualizer.plot_learning_curves()
+    visualizer.plot_confusion_matrices()
+    visualizer.plot_roc_curves()
+    visualizer.plot_precision_recall_curves()
+    visualizer.save_run_metrics()
+
+    # Save model
+    torch.save(model.state_dict(), args.model_output)
 
 
 if __name__ == "__main__":
