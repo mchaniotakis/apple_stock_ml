@@ -1,0 +1,20 @@
+{
+  "timestamp": "2024-12-06T18:52:58.306814",
+  "models": {
+    "Random Forest": {
+      "accuracy": 0.8353293413173652,
+      "macro_avg_f1": 0.6052094302722916,
+      "weighted_avg_f1": 0.812768565724711
+    },
+    "Temporal CNN": {
+      "accuracy": 0.15568862275449102,
+      "macro_avg_f1": 0.13471502590673573,
+      "weighted_avg_f1": 0.041947193695510525
+    },
+    "Improved Model": {
+      "accuracy": 0.688622754491018,
+      "macro_avg_f1": 0.5896999763760926,
+      "weighted_avg_f1": 0.7284331408055612
+    }
+  }
+}

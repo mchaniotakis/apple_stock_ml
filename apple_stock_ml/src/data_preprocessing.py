@@ -11,12 +11,14 @@ import os
 from matplotlib import pyplot as plt
 from apple_stock_ml.src.utils.logger import setup_logger
 from apple_stock_ml.src.utils.visualizer import ModelVisualizer
-from apple_stock_ml import SEED
+from apple_stock_ml import set_seeds, SEED
 from imblearn.over_sampling import SMOTE
 from collections import Counter
 from tqdm import tqdm
 import torch
 import random
+
+set_seeds()
 
 # Set up logger
 logger = setup_logger("data_preprocessing", "logs/data_preprocessing.log")
@@ -158,7 +160,7 @@ def calculate_daily_returns(df):
         (df["Adj Close"] - df["Adj Close"].shift(1)) / df["Adj Close"].shift(1) * 100
     )
     # Handle any missing values (due to holidays or weekends)
-    df["Daily_Return"] = df["Daily_Return"].fillna(0)
+    df["Daily_Return"] = df["Daily_Return"].fillna(0).shift(1)
 
     return df
 
@@ -314,7 +316,7 @@ def add_noise_to_sequence(batched_sequence, p=0.3):
         for feature in range(sequence.shape[0]):
             noise_magnitude = torch.std(sequence[feature]) * torch.FloatTensor(
                 1
-            ).uniform_(0.09, 0.11).to(sequence.device)
+            ).uniform_(0.9, 1.1).to(sequence.device)
             noise = torch.normal(
                 mean=0.0, std=float(noise_magnitude), size=sequence[feature].shape
             ).to(sequence.device)
@@ -423,7 +425,8 @@ def create_sequences(
     sequence_length=10,
     use_smote=False,
     as_tensor=True,
-    flatten_by=None,
+    flatten=False,
+    idx_to_keep=None,
 ):
     """Create sequences for temporal data for all possible points.
 
@@ -467,9 +470,10 @@ def create_sequences(
     all_targets = np.concatenate(np.array(all_targets))
     # Transpose sequences to shape [n_sequences, n_features, sequence_length] for CNN input
     all_sequences = all_sequences.transpose(0, 2, 1)
-    if flatten_by:
+    if idx_to_keep:
+        all_sequences = all_sequences[:, idx_to_keep, :]
+    if flatten:
         # keep the idx provided
-        all_sequences = all_sequences[:, flatten_by, :]
         all_sequences = all_sequences.reshape(all_sequences.shape[0], -1)
     if as_tensor:
         return torch.FloatTensor(all_sequences), torch.LongTensor(all_targets)
@@ -490,8 +494,9 @@ def get_data(
     cache_dir="data/cache",
     sequence_length=10,
     as_tensor=False,
-    flatten_by=None,
+    flatten=False,
     apply_pca=False,
+    idx_to_keep=None,
 ):
     """Fetch stocks, prepare features, and split into train, val, and test sets with sequences."""
     cache_path = get_cache_path(ticker, start_date, end_date, cache_dir)
@@ -528,7 +533,8 @@ def get_data(
         all_y_train,
         sequence_length,
         as_tensor=as_tensor,
-        flatten_by=flatten_by,
+        flatten=flatten,
+        idx_to_keep=idx_to_keep,
         use_smote=use_smote,
     )
     X_val_seq, y_val_seq = create_sequences(
@@ -536,7 +542,9 @@ def get_data(
         all_y_val,
         sequence_length,
         as_tensor=as_tensor,
-        flatten_by=flatten_by,
+        flatten=flatten,
+        idx_to_keep=idx_to_keep,
+        use_smote=use_smote,
     )
 
     X_test_seq, y_test_seq = create_sequences(
@@ -544,7 +552,9 @@ def get_data(
         all_y_test,
         sequence_length,
         as_tensor=as_tensor,
-        flatten_by=flatten_by,
+        flatten=flatten,
+        idx_to_keep=idx_to_keep,
+        use_smote=use_smote,
     )
     if apply_pca:
         logger.info("Applying PCA to sequences")

@@ -16,7 +16,7 @@ from apple_stock_ml.src.temporal_cnn import (
     EarlyStopping,
     compute_class_weight,
 )
-from apple_stock_ml import DEVICE
+from apple_stock_ml import DEVICE, SEED, set_seeds
 from apple_stock_ml.src.utils.logger import setup_logger
 from apple_stock_ml.src.utils.visualizer import ModelVisualizer
 from sklearn.metrics import classification_report, confusion_matrix
@@ -25,8 +25,9 @@ import math
 import os
 from tqdm import tqdm
 
+set_seeds()
 # Set up logger
-logger = setup_logger("train_timesnet", "logs/train_timesnet.log")
+logger = setup_logger("train_improvement", "logs/train_improvement.log")
 
 
 def parse_args():
@@ -38,7 +39,7 @@ def parse_args():
         "--sequence-length", type=int, default=100
     )  # needs to be more for timesNet
     parser.add_argument("--patience", type=int, default=7)
-    parser.add_argument("--model-output", type=str, default="models/timesnet.pt")
+    parser.add_argument("--model-output", type=str, default="models/improved.pt")
     parser.add_argument("--use-smote", action="store_true")
     parser.add_argument("--start-date", type=str, default="2015-01-01")
     parser.add_argument("--end-date", type=str, default="2024-01-31")
@@ -50,7 +51,17 @@ def parse_args():
     return parser.parse_args()
 
 
-def evaluate_model(model, test_loader, device):
+def evaluate_model(
+    model: torch.nn.Module,
+    test_loader: DataLoader,
+    pca: bool = False,
+    ticker: str = "AAPL",
+    start_date: str = "2015-01-01",
+    end_date: str = "2024-01-31",
+    threshold: float = 2.0,
+    sequence_length: int = 10,
+):
+
     model.eval()
     all_preds = []
     all_labels = []
@@ -58,7 +69,9 @@ def evaluate_model(model, test_loader, device):
 
     with torch.no_grad():
         for batch_X, batch_y, _ in test_loader:
-            batch_X = batch_X.to(device)
+            # normalize data
+            batch_X = normalize_data(batch_X)
+            batch_X = batch_X.to(DEVICE)
             outputs = model(batch_X, None)
             probabilities = F.softmax(outputs, dim=1)
             predictions = outputs.argmax(dim=1)
@@ -75,7 +88,9 @@ def evaluate_model(model, test_loader, device):
 
     # Calculate metrics
     conf_matrix = confusion_matrix(all_labels, all_preds)
-    class_report = classification_report(all_labels, all_preds)
+    class_report = classification_report(
+        all_labels, all_preds, output_dict=True
+    )  # output_dict=True to get a dictionary
 
     return {
         "confusion_matrix": conf_matrix,
@@ -144,6 +159,75 @@ def padding_mask(lengths, max_len=None):
         .repeat(batch_size, 1)
         .lt(lengths.unsqueeze(1))
     )
+
+
+def save_model(model, filepath):
+    """Save the trained model to disk.
+
+    Args:
+        model (TimesNet): The model to save
+        filepath (str): Path where to save the model
+    """
+    Path(filepath).parent.mkdir(parents=True, exist_ok=True)
+
+    # Create dictionary with model parameters and state
+    model_data = {
+        "state_dict": model.state_dict(),
+        "input_channels": model.enc_embedding.value_embedding.tokenConv.in_channels,
+        "sequence_length": model.sequence_length,
+        "num_classes": model.projection.out_features,
+        "num_layers": model.num_layers,
+        "dimension_model": model.dimension_model,
+        "dropout": model.dropout.p,
+        "freq": "h",  # Default frequency for time features
+        "embed_type": "timeF",  # Default embedding type
+        "prediction_length": model.prediction_length,
+        "hidden_dim": model.model_layers[0].conv[0].kernels[0].out_channels,
+        "num_kernels": len(model.model_layers[0].conv[0].kernels),
+        "top_k": model.model_layers[0].top_k,
+    }
+
+    torch.save(model_data, filepath)
+    logger.info(f"Model saved to {filepath}")
+
+
+def load_model(filepath):
+    """Load a saved model from disk.
+
+    Args:
+        filepath (str): Path to the saved model data
+
+    Returns:
+        TimesNet: Loaded model
+    """
+    try:
+        model_data = torch.load(filepath, map_location=DEVICE)
+
+        # Initialize model with saved parameters
+        model = TimesNet(
+            input_channels=model_data["input_channels"],
+            sequence_length=model_data["sequence_length"],
+            num_classes=model_data["num_classes"],
+            num_layers=model_data["num_layers"],
+            dimension_model=model_data["dimension_model"],
+            dropout=model_data["dropout"],
+            freq=model_data["freq"],
+            embed_type=model_data["embed_type"],
+            prediction_length=model_data["prediction_length"],
+            hidden_dim=model_data["hidden_dim"],
+            num_kernels=model_data["num_kernels"],
+            top_k=model_data["top_k"],
+        )
+
+        # Load the state dictionary
+        model.load_state_dict(model_data["state_dict"])
+        model = model.to(DEVICE)
+        logger.info(f"Model loaded from {filepath}")
+        return model
+
+    except Exception as e:
+        logger.error(f"Error loading model from {filepath}: {str(e)}")
+        raise
 
 
 class Normalizer(object):
@@ -545,7 +629,7 @@ class TimesNet(nn.Module):
         prediction_length=0,
         hidden_dim=256,
         num_kernels=6,
-        top_k=3,
+        top_k=4,
     ):
         super(TimesNet, self).__init__()
         self.sequence_length = sequence_length
@@ -599,13 +683,28 @@ class TimesNet(nn.Module):
         return output
 
 
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=None, gamma=2):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def forward(self, inputs, targets):
+        ce_loss = F.cross_entropy(inputs, targets, reduction="none", weight=self.alpha)
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1 - pt) ** self.gamma * ce_loss).mean()
+        return focal_loss
+
+
 def train_model(
     model,
     train_loader,
     val_loader,
     criterion,
     optimizer,
-    scheduler,
+    warmup_epochs,
+    warmup_scheduler,
+    plateau_scheduler,
     use_augmentations=True,
     num_epochs=100,
     patience=7,
@@ -623,7 +722,8 @@ def train_model(
     weights = torch.FloatTensor(class_weights).to(DEVICE)
 
     # Update criterion with weights
-    criterion = nn.CrossEntropyLoss(weight=weights)
+    criterion = nn.CrossEntropyLoss()
+    # criterion = FocalLoss(alpha=weights)
 
     early_stopping = EarlyStopping(patience=patience)
 
@@ -640,6 +740,7 @@ def train_model(
         for batch_X, batch_y, padding_mask in tqdm(
             train_loader, desc=f"Training epoch {epoch+1}"
         ):
+            batch_X = normalize_data(batch_X)
             batch_X, batch_y = batch_X.to(DEVICE), batch_y.to(DEVICE)
             padding_mask = padding_mask.to(DEVICE)
             if use_augmentations:
@@ -670,12 +771,16 @@ def train_model(
                 val_loss += criterion(outputs, batch_y).item()
                 if best_model is None or val_loss < best_val_loss:
                     best_val_loss = val_loss
-                    best_model = model.state_dict()
+                    best_model = model
         avg_val_loss = val_loss / len(val_loader)
         val_losses.append(avg_val_loss)
 
-        # Step the scheduler based on validation loss
-        scheduler.step(avg_val_loss)
+        if epoch > warmup_epochs:
+            plateau_scheduler.step(
+                avg_val_loss
+            )  # Pass validation loss to plateau scheduler
+        else:
+            warmup_scheduler.step()
 
         # Log progress
         logger.info(f"Epoch {epoch+1}/{num_epochs}")
@@ -688,7 +793,7 @@ def train_model(
             logger.info("Early stopping triggered")
             break
 
-    return model, train_losses, val_losses
+    return best_model, train_losses, val_losses
 
 
 def invert_channel_dimension(X):
@@ -709,7 +814,9 @@ def main():
         as_tensor=True,
         apply_pca=args.pca,
     )
-    X_train, X_val, X_test = normalize_data(X_train, X_val, X_test)
+    # X_train = normalize_data(X_train)
+    # X_val = normalize_data(X_val)
+    # X_test = normalize_data(X_test)
 
     X_train = invert_channel_dimension(X_train)
     X_val = invert_channel_dimension(X_val)
@@ -717,22 +824,26 @@ def main():
 
     # Get balanced sampler
     sampler = get_balanced_sampler(X_train, y_train)
-
+    g = torch.Generator()
+    g.manual_seed(SEED)
     # Create data loader with the sampler
     train_loader = torch.utils.data.DataLoader(
         torch.utils.data.TensorDataset(X_train, y_train),
         batch_size=args.batch_size,
+        generator=g,
         sampler=sampler,
         collate_fn=lambda x: collate_fn(x, max_len=args.sequence_length),
     )
     val_loader = torch.utils.data.DataLoader(
         torch.utils.data.TensorDataset(X_val, y_val),
         batch_size=args.batch_size,
+        generator=g,
         collate_fn=lambda x: collate_fn(x, max_len=args.sequence_length),
     )
     test_loader = torch.utils.data.DataLoader(
         torch.utils.data.TensorDataset(X_test, y_test),
         batch_size=args.batch_size,
+        generator=g,
         collate_fn=lambda x: collate_fn(x, max_len=args.sequence_length),
     )
 
@@ -741,30 +852,57 @@ def main():
         input_channels=X_train.shape[2],  # padded to sequence length
         sequence_length=args.sequence_length,
         dropout=0.1,
-        freq="d",
+        freq="h",
         embed_type="timeF",
         num_classes=2,
         dimension_model=64,
         num_layers=3,
-        top_k=1,
+        top_k=2,
         prediction_length=0,
     )
 
     # Initialize visualizer
-    visualizer = ModelVisualizer(save_dir="visualizations/timesnet")
+    visualizer = ModelVisualizer(save_dir="visualizations/improvement")
     # Define loss and optimizer
     criterion = nn.CrossEntropyLoss()
 
+    # Set the number of warm-up epochs
+    warmup_epochs = 5
+
+    # Define a lambda function for the warm-up phase
+    def warmup_lr_lambda(epoch):
+        if epoch < warmup_epochs:
+            return float(epoch + 1) / warmup_epochs
+        return 1.0
+
     optimizer = optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=1e-5)
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=args.learning_rate,
-        epochs=args.epochs,
-        steps_per_epoch=len(train_loader),
-        pct_start=0.3,  # Spend 30% of time warming up
-        div_factor=25,  # Initial lr = max_lr/25
-        final_div_factor=1e4,  # Final lr = max_lr/10000
+
+    # Create a LambdaLR scheduler for the warm-up
+    warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer, lr_lambda=warmup_lr_lambda
     )
+
+    # Create a ReduceLROnPlateau scheduler for after the warm-up
+    plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=0.5,
+        patience=3,
+        verbose=True,
+        min_lr=1e-6,
+        threshold=0.01,
+        threshold_mode="rel",
+    )
+
+    # scheduler = torch.optim.lr_scheduler.OneCycleLR(
+    #     optimizer,
+    #     max_lr=args.learning_rate,
+    #     epochs=args.epochs,
+    #     steps_per_epoch=len(train_loader),
+    #     pct_start=0.3,  # Spend 30% of time warming up
+    #     div_factor=25,  # Initial lr = max_lr/25
+    #     final_div_factor=1e4,  # Final lr = max_lr/10000
+    # )
 
     # Train model
     model, train_losses, val_losses = train_model(
@@ -773,7 +911,9 @@ def main():
         val_loader,
         criterion,
         optimizer,
-        scheduler,
+        warmup_epochs=5,
+        warmup_scheduler=warmup_scheduler,
+        plateau_scheduler=plateau_scheduler,
         use_augmentations=args.augs,
         num_epochs=args.epochs,
         patience=args.patience,
@@ -807,7 +947,7 @@ def main():
 
     os.makedirs(os.path.dirname(args.model_output), exist_ok=True)
     # Save model
-    torch.save(model.state_dict(), args.model_output)
+    save_model(model, args.model_output)
 
 
 if __name__ == "__main__":

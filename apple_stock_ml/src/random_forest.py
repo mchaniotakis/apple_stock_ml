@@ -11,7 +11,7 @@ import pickle
 from datetime import datetime
 from sklearn.utils.class_weight import compute_class_weight
 from apple_stock_ml.src.utils.logger import setup_logger
-from apple_stock_ml import SEED
+from apple_stock_ml import set_seeds
 from apple_stock_ml.src.data_preprocessing import (
     get_data,
 )
@@ -21,7 +21,7 @@ from sklearn.model_selection import RandomizedSearchCV
 from tqdm import tqdm
 import time
 
-
+set_seeds()
 # Set up logger
 logger = setup_logger("random_forest", "logs/random_forest.log")
 
@@ -89,7 +89,7 @@ def train_random_forest(
             max_depth=15,
             min_samples_split=5,
             min_samples_leaf=2,
-            class_weight="balanced_subsample",
+            class_weight="balanced",
             random_state=42,
             n_jobs=-1,
             verbose=1,  # Enable built-in verbosity
@@ -136,17 +136,17 @@ def train_model_in_batches(model, X_train, y_train, batch_size=50000):
             pbar.update(1)
 
 
-def evaluate_model(model, X, y, set_name="Test"):
-    """Evaluate the model and print performance metrics.
-
-    Returns:
-        dict: Dictionary containing evaluation metrics and predictions
-    """
+def evaluate_model(model, X, y, set_name="latest"):
     predictions = model.predict(X)
     probabilities = model.predict_proba(X)
 
     # Calculate confusion matrix
     cm = confusion_matrix(y, predictions)
+
+    # Calculate sensitivity (True Positive Rate) and specificity (True Negative Rate)
+    tn, fp, fn, tp = cm.ravel()
+    sensitivity = tp / (tp + fn)
+    specificity = tn / (tn + fp)
 
     # Calculate classification report
     report = classification_report(y, predictions, output_dict=True)
@@ -157,6 +157,11 @@ def evaluate_model(model, X, y, set_name="Test"):
     logger.info(cm)
     logger.info("\nClassification Report:")
     logger.info(classification_report(y, predictions))
+    logger.info(f"Sensitivity (TPR): {sensitivity:.4f}")
+    logger.info(f"Specificity (TNR): {specificity:.4f}")
+
+    postive_to_negative_ratio = np.sum(y) / len(y)
+    prediction_positive_to_negative_ratio = np.sum(predictions) / len(predictions)
 
     # Return comprehensive metrics
     metrics = {
@@ -164,10 +169,21 @@ def evaluate_model(model, X, y, set_name="Test"):
         "true_values": y,
         "probabilities": probabilities,
         "confusion_matrix": cm,
+        "sensitivity": sensitivity,
+        "specificity": specificity,
+        "postive_to_negative_ratio": postive_to_negative_ratio,
+        "prediction_positive_to_negative_ratio": prediction_positive_to_negative_ratio,
         "classification_report": report,
     }
 
     return metrics
+
+
+def load_model(filepath):
+    """Load the trained model from disk."""
+    with open(filepath, "rb") as f:
+        model = pickle.load(f)
+    return model
 
 
 def save_model(model, filepath):
@@ -228,29 +244,46 @@ def parse_args():
     return parser.parse_args()
 
 
-def get_cache_path(args):
-    """Generate cache file path based on parameters."""
-    cache_dir = Path(args.cache_dir)
-    cache_dir.mkdir(parents=True, exist_ok=True)
+def normalize_data(X_train, X_val, X_test):
+    """Normalize the data using training set statistics, except for the last channel"""
+    mean = X_train.mean()
+    std = X_train.std()
 
-    cache_name = f"{args.ticker}_{args.start_date}_{args.end_date}.pkl"
-    return cache_dir / cache_name
+    X_train_norm = (X_train - mean) / (std + 1e-8)
+    X_val_norm = (X_val - mean) / (std + 1e-8)
+    X_test_norm = (X_test - mean) / (std + 1e-8)
+
+    return X_train_norm, X_val_norm, X_test_norm
 
 
-def main():
-    args = parse_args()
+def main(
+    ticker: str,
+    start_date: str = "2015-01-01",
+    end_date: str = "2024-12-01",
+    threshold: float = 2.0,
+    sequence_length: int = 10,
+    use_smote: bool = False,
+    optimize: bool = False,
+    model_output: str = "models/random_forest.pkl",
+):
     # we need to flatten the data for random forrest
-    features = ["Adj Close", "Close", "High", "Low", "Open", "Volume", "Daily_Return"]
-    flatten_by = [5]
+    # features = ["Adj Close", "Close", "High", "Low", "Open", "Volume", "Daily_Return"]
+    idx_to_keep = [5]
     X_train_seq, X_val_seq, X_test_seq, y_train_seq, y_val_seq, y_test_seq = get_data(
-        ticker=args.ticker,
-        start_date=args.start_date,
-        end_date=args.end_date,
-        threshold=args.threshold,
-        use_smote=args.use_smote,
-        sequence_length=10,
+        ticker=ticker,
+        start_date=start_date,
+        end_date=end_date,
+        threshold=threshold,
+        use_smote=use_smote,
+        sequence_length=sequence_length,
         as_tensor=False,
-        flatten_by=flatten_by,
+        flatten=True,
+        idx_to_keep=idx_to_keep,
+    )
+
+    # normalize the data
+    X_train_seq, X_val_seq, X_test_seq = normalize_data(
+        X_train_seq, X_val_seq, X_test_seq
     )
 
     # Initialize visualizer
@@ -262,7 +295,7 @@ def main():
         y_train_seq,
         X_val_seq,
         y_val_seq,
-        optimize_hyperparams=args.optimize,
+        optimize_hyperparams=optimize,
     )
 
     # Evaluate model on validation set
@@ -270,6 +303,11 @@ def main():
 
     # Evaluate model on test set
     test_metrics = evaluate_model(model, X_test_seq, y_test_seq, "Test")
+
+    positive_to_negative_data = float(y_test_seq.sum() / len(y_test_seq))
+    positive_to_negative_predicted = float(
+        test_metrics["predictions"].sum() / len(test_metrics["predictions"])
+    )
 
     # Add run to visualizer with metadata
     visualizer.add_evaluation(
@@ -281,7 +319,9 @@ def main():
             "min_samples_split": model.min_samples_split,
             "min_samples_leaf": model.min_samples_leaf,
             "class_weight": model.class_weight,
-            "optimize_hyperparams": args.optimize,
+            "optimize_hyperparams": optimize,
+            "positive_to_negative_data": positive_to_negative_data,
+            "positive_to_negative_predicted": positive_to_negative_predicted,
         },
     )
 
@@ -292,8 +332,17 @@ def main():
     visualizer.save_run_metrics()
 
     # Save model
-    save_model(model, args.model_output)
+    save_model(model, model_output)
 
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+
+    main(
+        ticker=args.ticker,
+        start_date=args.start_date,
+        end_date=args.end_date,
+        threshold=args.threshold,
+        use_smote=args.use_smote,
+        optimize=args.optimize,
+    )

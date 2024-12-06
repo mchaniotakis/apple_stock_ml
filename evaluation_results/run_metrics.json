@@ -1,0 +1,24 @@
+{
+  "Random Forest": {
+    "metadata": {
+      "model_type": "random_forest"
+    },
+    "timestamp": "2024-12-06T18:52:55.869393",
+    "accuracy": 0.8353293413173652
+  },
+  "Temporal CNN": {
+    "metadata": {
+      "model_type": "temporal_cnn"
+    },
+    "timestamp": "2024-12-06T18:52:57.215417",
+    "accuracy": 0.15568862275449102,
+    "test_loss": 0.0
+  },
+  "Improved Model": {
+    "metadata": {
+      "model_type": "improved"
+    },
+    "timestamp": "2024-12-06T18:52:57.941631",
+    "accuracy": 0.688622754491018
+  }
+}
